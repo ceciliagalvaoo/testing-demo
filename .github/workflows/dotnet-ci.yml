@@ -1,0 +1,204 @@
+name: dotnet-ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - "dotnet-app/**"
+      - ".github/workflows/dotnet-ci.yml"
+  pull_request:
+    paths:
+      - "dotnet-app/**"
+      - ".github/workflows/dotnet-ci.yml"
+  workflow_dispatch:
+
+concurrency:                         # a new push to the same PR cancels the previous, now useless, run
+  group: dotnet-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+defaults:
+  run:
+    working-directory: dotnet-app
+
+jobs:
+  # ---------------------------------------------------------------- 1) build + unit tests
+  unit:
+    name: build + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('dotnet-app/**/*.csproj') }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --configuration Release --no-restore
+
+      # coverlet instruments the assembly while building, so this step must not use --no-build
+      - name: Unit tests with a coverage gate (domain >= 80 %)
+        run: >
+          dotnet test tests/LendIt.Tests --configuration Release --no-restore
+          --filter "Category=Unit"
+          --logger "trx;LogFileName=unit.trx" --results-directory TestResults
+          -p:CollectCoverage=true -p:CoverletOutputFormat=cobertura
+          -p:CoverletOutput=../../TestResults/coverage/
+          -p:Include="[LendIt.Api]LendIt.Api.Domain.*"
+          -p:Threshold=80 -p:ThresholdType=line -p:ThresholdStat=total
+
+      - name: Coverage summary in the run summary
+        if: always()
+        run: |
+          dotnet tool install --global dotnet-reportgenerator-globaltool
+          reportgenerator -reports:TestResults/coverage/coverage.cobertura.xml \
+            -targetdir:TestResults/coverage/html -reporttypes:"Html;MarkdownSummaryGithub"
+          cat TestResults/coverage/html/SummaryGithub.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload test results and coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-unit-results
+          path: dotnet-app/TestResults
+
+  # ---------------------------------------------------------------- 2) integration tests
+  integration:
+    name: integration tests
+    needs: unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('dotnet-app/**/*.csproj') }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      - name: Integration tests
+        run: >
+          dotnet test tests/LendIt.Tests --configuration Release
+          --filter "Category=Integration"
+          --logger "trx;LogFileName=integration.trx" --results-directory TestResults
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-integration-results
+          path: dotnet-app/TestResults
+
+  # ---------------------------------------------------------------- 3) image + E2E + UI (+ publish)
+  e2e:
+    name: image + E2E + UI tests
+    needs: integration
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write                 # needed only to push the image to ghcr.io
+    env:
+      BASE_URL: http://localhost:8080
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Compute the (lowercase) image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}/lendit-dotnet" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the image (the one that is tested, and later published)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./dotnet-app
+          file: ./dotnet-app/Dockerfile
+          load: true                  # load the image into the runner's Docker, do not push yet
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # --retry-all-errors also retries "connection reset" while Kestrel is still starting
+      - name: Start the container and wait until it answers
+        run: |
+          docker run -d --name lendit -p 8080:8080 "$IMAGE:$GITHUB_SHA"
+          curl --fail --silent --retry 30 --retry-delay 1 --retry-all-errors "$BASE_URL/items" > /dev/null
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('dotnet-app/**/*.csproj') }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      - name: E2E tests
+        run: >
+          dotnet test tests/LendIt.E2E.Tests --configuration Release
+          --logger "trx;LogFileName=e2e.trx" --results-directory TestResults
+
+      - name: Install the Playwright browser
+        run: |
+          dotnet build tests/LendIt.UI.Tests --configuration Release
+          pwsh tests/LendIt.UI.Tests/bin/Release/net10.0/playwright.ps1 install --with-deps chromium
+
+      - name: UI tests
+        run: >
+          dotnet test tests/LendIt.UI.Tests --configuration Release --no-build
+          --logger "trx;LogFileName=ui.trx" --results-directory TestResults
+
+      - name: Show the container log on failure
+        if: failure()
+        run: docker logs lendit
+
+      - name: Upload test results and screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-e2e-ui-results
+          path: |
+            dotnet-app/TestResults
+            dotnet-app/tests/LendIt.UI.Tests/bin/Release/net10.0/screenshots
+
+      # ---- only reached when every test above passed; never on pull requests
+      - name: Log in to ghcr.io
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push the tested image
+        if: github.event_name != 'pull_request'
+        run: |
+          docker push "$IMAGE:$GITHUB_SHA"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"            # git tag v0.2.0 -> image tag 0.2.0
+            docker tag "$IMAGE:$GITHUB_SHA" "$IMAGE:$VERSION"
+            docker push "$IMAGE:$VERSION"
+          elif [ "$GITHUB_REF_NAME" = "main" ]; then
+            docker tag "$IMAGE:$GITHUB_SHA" "$IMAGE:main"
+            docker push "$IMAGE:main"
+          fi
