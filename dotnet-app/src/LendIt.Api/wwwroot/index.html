@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -31,11 +31,11 @@
         li.dataset.testid = 'item-' + item.id;
 
         const name = document.createElement('span');
-        name.textContent = item.name + ' – ';
+        name.textContent = item.name + ' â€“ ';
 
         const status = document.createElement('span');
         status.dataset.testid = 'item-' + item.id + '-status';
-        status.textContent = item.available ? 'Available' : 'Lent out';
+        status.textContent = item.available ? 'Available' : 'On loan';
 
         const button = document.createElement('button');
         button.dataset.testid = 'lend-button-' + item.id;
