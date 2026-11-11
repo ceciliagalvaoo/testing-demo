@@ -14,7 +14,7 @@ public class LoanService(IItemRepository items, ILoanRepository loans, TimeProvi
         if (!item.Available)
             throw new RuleViolationException("Item is already lent out.");
 
-        if (loans.CountActive(borrower) >= MaxActiveLoans)
+        if (loans.CountActive(borrower) > MaxActiveLoans)
             throw new RuleViolationException($"{borrower} already has {MaxActiveLoans} active loans.");
 
         items.Save(item with { Available = false });
