@@ -1,0 +1,134 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: lendit-dotnet
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.VERSION }}
+      channel: ${{ steps.v.outputs.CHANNEL }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - id: v
+        run: .github/scripts/version.sh >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------- GHCR: add the names
+  promote-ghcr:
+    name: promote in GHCR
+    needs: version
+    runs-on: ubuntu-latest
+    environment: ${{ needs.version.outputs.channel == 'release' && 'production' || 'test' }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      CHANNEL: ${{ needs.version.outputs.channel }}
+    steps:
+      - name: Compute the (lowercase) image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}/${IMAGE_NAME}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: The tagged commit must already have a tested image
+        run: |
+          if ! docker buildx imagetools inspect "$IMAGE:$GITHUB_SHA" > /dev/null 2>&1; then
+            echo "::error::No tested image for commit $GITHUB_SHA. Tag a commit that has passed the pipeline on main."
+            exit 1
+          fi
+
+      - name: Promote (retag, no rebuild)
+        run: |
+          TAGS=("$VERSION")
+          if [ "$CHANNEL" = "rc" ]; then
+            TAGS+=("rc")
+          elif [ "$CHANNEL" = "release" ]; then
+            MAJOR="${VERSION%%.*}"
+            MINOR="${VERSION#*.}"; MINOR="${MINOR%%.*}"
+            TAGS+=("$MAJOR.$MINOR" "$MAJOR" "latest")
+          fi
+          for TAG in "${TAGS[@]}"; do
+            # --prefer-index=false: the new tag points at the very same manifest (same digest)
+            docker buildx imagetools create --prefer-index=false --tag "$IMAGE:$TAG" "$IMAGE:$GITHUB_SHA"
+          done
+          for TAG in "$GITHUB_SHA" "${TAGS[@]}"; do
+            printf '%-42s %s\n' "$TAG" "$(docker buildx imagetools inspect "$IMAGE:$TAG" | grep -i '^Digest')"
+          done | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------- Docker Hub: releases only
+  publish-dockerhub:
+    name: publish to Docker Hub
+    needs: [version, promote-ghcr]
+    if: needs.version.outputs.channel == 'release'
+    runs-on: ubuntu-latest
+    environment: production                      # DOCKERHUB_TOKEN exists only in this environment
+    permissions:
+      contents: read
+      packages: read
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Compute the image names
+        run: |
+          echo "SOURCE=ghcr.io/${GITHUB_REPOSITORY,,}/${IMAGE_NAME}" >> "$GITHUB_ENV"
+          echo "TARGET=docker.io/${{ vars.DOCKERHUB_USERNAME }}/lendit" >> "$GITHUB_ENV"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Copy the exact image from GHCR to Docker Hub
+        run: |
+          docker pull "$SOURCE:$VERSION"
+          MAJOR="${VERSION%%.*}"
+          MINOR="${VERSION#*.}"; MINOR="${MINOR%%.*}"
+          for TAG in "$VERSION" "$MAJOR.$MINOR" "$MAJOR" latest; do
+            docker tag "$SOURCE:$VERSION" "$TARGET:$TAG"
+            docker push "$TARGET:$TAG"
+          done
+
+  # ---------------------------------------------------------------- GitHub Release
+  github-release:
+    name: GitHub Release
+    needs: [version, promote-ghcr]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write                            # the only job that may write to the repository
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CHANNEL: ${{ needs.version.outputs.channel }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Create the release with generated notes
+        run: |
+          FLAGS=(--generate-notes)
+          if [ "$CHANNEL" = "rc" ]; then FLAGS+=(--prerelease); fi
+          gh release create "$GITHUB_REF_NAME" "${FLAGS[@]}"
