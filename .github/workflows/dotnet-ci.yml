@@ -2,15 +2,16 @@ name: dotnet-ci
 
 on:
   push:
-    branches: [main]
-    tags: ["v*"]
+    branches: [main]                 # no tags here: tags are promoted by release.yml, never rebuilt
     paths:
       - "dotnet-app/**"
       - ".github/workflows/dotnet-ci.yml"
+      - ".github/scripts/**"
   pull_request:
     paths:
       - "dotnet-app/**"
       - ".github/workflows/dotnet-ci.yml"
+      - ".github/scripts/**"
   workflow_dispatch:
 
 concurrency:                         # a new push to the same PR cancels the previous, now useless, run
@@ -181,6 +182,14 @@ jobs:
             dotnet-app/TestResults
             dotnet-app/tests/LendIt.UI.Tests/bin/Release/net10.0/screenshots
 
+      # ---- after the functional tests, before the push: a known, fixable HIGH/CRITICAL CVE stops the build
+      - name: Scan the image (fail on fixable HIGH/CRITICAL vulnerabilities)
+        run: >
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock
+          aquasec/trivy:0.76.1 image
+          --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1
+          "$IMAGE:$GITHUB_SHA"
+
       # ---- only reached when every test above passed; never on pull requests
       - name: Log in to ghcr.io
         if: github.event_name != 'pull_request'
@@ -190,15 +199,48 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push the tested image
+      - name: Push the tested image (identified by the commit)
         if: github.event_name != 'pull_request'
+        run: docker push "$IMAGE:$GITHUB_SHA"
+
+  # ---------------------------------------------------------------- 4) dev channel: add names, no rebuild
+  publish-test:
+    name: publish dev image
+    needs: e2e
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: test
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0                       # the version script needs the tags
+
+      - name: Compute version
+        id: v
+        working-directory: .                   # this workflow's default is dotnet-app/
+        run: .github/scripts/version.sh >> "$GITHUB_OUTPUT"
+
+      - name: Compute the (lowercase) image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}/lendit-dotnet" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Add the dev names to the tested image (no rebuild)
         run: |
-          docker push "$IMAGE:$GITHUB_SHA"
-          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
-            VERSION="${GITHUB_REF_NAME#v}"            # git tag v0.2.0 -> image tag 0.2.0
-            docker tag "$IMAGE:$GITHUB_SHA" "$IMAGE:$VERSION"
-            docker push "$IMAGE:$VERSION"
-          elif [ "$GITHUB_REF_NAME" = "main" ]; then
-            docker tag "$IMAGE:$GITHUB_SHA" "$IMAGE:main"
-            docker push "$IMAGE:main"
-          fi
+          # --prefer-index=false: keep the single-platform manifest, so the digest stays identical
+          # (the default would wrap it in a new image index with a different digest)
+          docker buildx imagetools create --prefer-index=false \
+            --tag "$IMAGE:${{ steps.v.outputs.VERSION }}" \
+            --tag "$IMAGE:dev" \
+            "$IMAGE:$GITHUB_SHA"
+          docker buildx imagetools inspect "$IMAGE:dev"
+          echo "### dev image: \`$IMAGE:${{ steps.v.outputs.VERSION }}\`" >> "$GITHUB_STEP_SUMMARY"
